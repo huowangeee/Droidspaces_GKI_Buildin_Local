@@ -145,6 +145,13 @@ confirm() {
     local default="${2:-n}"
     local yn
 
+    # GitHub Actions and other non-interactive jobs have no TTY. In CI mode,
+    # always take the declared default instead of blocking on a prompt.
+    if [ "${CI_MODE:-false}" = "true" ]; then
+        [ "$default" = "y" ]
+        return
+    fi
+
     if [ "$default" = "y" ]; then
         read -r -p "$(echo -e "${YELLOW}${prompt} [Y/n]:${NC} ")" yn
         yn=${yn:-y}
