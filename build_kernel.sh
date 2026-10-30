@@ -1336,11 +1336,30 @@ run_ci_build() {
     setup_ccache
 
     if [ -z "${BUILD_CFG[kernel_source]}" ] && [ -z "${BUILD_CFG[kernel_source_tarball]}" ]; then
-        if ! fetch_kernel_source; then
-            log_warn "$(txt "直连下载失败，尝试 GitHub 镜像" "Direct download failed; retrying through a GitHub mirror")"
-            KERNEL_SOURCE_MIRROR="${KERNEL_SOURCE_FALLBACK_MIRROR:-gh-proxy}"
+        local source_requested="${KERNEL_SOURCE_MIRROR:-direct}"
+        local -a source_mirrors=()
+        case "$source_requested" in
+            direct) source_mirrors=(direct gh-proxy gh-llkk gh-ddlc) ;;
+            gh-proxy) source_mirrors=(gh-proxy direct gh-llkk gh-ddlc) ;;
+            gh-llkk) source_mirrors=(gh-llkk gh-proxy direct gh-ddlc) ;;
+            gh-ddlc) source_mirrors=(gh-ddlc gh-proxy direct gh-llkk) ;;
+            *) source_mirrors=("$source_requested") ;;
+        esac
+
+        local source_fetched=false
+        local source_mirror
+        for source_mirror in "${source_mirrors[@]}"; do
+            KERNEL_SOURCE_MIRROR="$source_mirror"
             export KERNEL_SOURCE_MIRROR
-            fetch_kernel_source || return 1
+            if fetch_kernel_source; then
+                source_fetched=true
+                break
+            fi
+            log_warn "$(txt "源码下载失败，尝试下一个下载源" "Source download failed; trying the next source"): $source_mirror"
+        done
+        if [ "$source_fetched" != "true" ]; then
+            log_error "$(txt "所有源码下载源均失败" "All kernel source download routes failed")"
+            return 1
         fi
     fi
 
