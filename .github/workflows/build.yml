@@ -142,10 +142,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo fallocate -l 4G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          if swapon --show=NAME --noheadings | grep -q .; then
+            echo "Swap is already enabled; skipping /swapfile creation."
+            sudo swapon --show
+          else
+            sudo rm -f /swapfile
+            sudo fallocate -l 4G /swapfile
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+          fi
           sudo sysctl vm.swappiness=10
           free -h
 
