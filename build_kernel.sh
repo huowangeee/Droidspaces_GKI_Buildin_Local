@@ -257,7 +257,9 @@ _lookup_os_patch_level() {
 _set_kernel_version_from_id() {
     local version_id="$1"
     if [[ "$version_id" =~ ^(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)$ ]]; then
-        local detected_sub="${BASH_REMATCH[3]%-lts}"
+        # 归档版本可能带有日期或 LTS 后缀，例如 168-2023-05、142-lts。
+        # 子版本只取后缀中的第一个数字段。
+        local detected_sub="${BASH_REMATCH[3]%%-*}"
         BUILD_CFG[android_version]="${BASH_REMATCH[1]}"
         BUILD_CFG[kernel_version]="${BASH_REMATCH[2]}"
         BUILD_CFG[sub_level]="$detected_sub"
@@ -350,12 +352,9 @@ fetch_kernel_source() {
         return 1
     fi
     if [ "${CI_MODE:-false}" = "true" ]; then
-        local ci_answers=""
-        ci_answers=$(_ci_source_fetch_answers) || {
-            rm -f "$fetch_script"
-            return 1
-        }
-        printf '%s\n' "$ci_answers" | \
+        # 直接流式输出答案。不能先保存到 $() 变量，因为命令替换会删除
+        # 末尾空行，导致上游脚本最后一次 read 收不到默认确认输入。
+        _ci_source_fetch_answers | \
             SCRIPT_LANG="${APP_LANG:-en}" OUTPUT_DIR="$HOME/kernel-sources" TMPDIR="$HOME/kernel-sources/.tmp" \
             EXTRACT=no KEEP_TARBALL=yes \
             bash "$fetch_script" 2>&1 | tee "$tmp_out" || ret=${PIPESTATUS[1]}
