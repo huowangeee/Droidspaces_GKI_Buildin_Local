@@ -1,0 +1,201 @@
+name: Build GKI Kernel
+
+"on":
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Android / kernel target"
+        required: true
+        type: choice
+        default: "android15-6.6"
+        options:
+          - android12-5.10
+          - android13-5.15
+          - android14-6.1
+          - android15-6.6
+          - android16-6.12
+          - android17-6.18
+      sub_level:
+        description: "Kernel sublevel (for example 77, 173, or X for current LTS)"
+        required: true
+        default: "X"
+        type: string
+      ksu_variant:
+        description: "KernelSU variant"
+        required: true
+        type: choice
+        default: "ReSukiSU"
+        options:
+          - None
+          - ReSukiSU
+          - Official
+      ksu_branch:
+        description: "KernelSU branch"
+        required: true
+        type: choice
+        default: "Stable"
+        options:
+          - Stable
+          - Dev
+      droidspaces:
+        description: "Droidspaces mode (auto uses 678 below 6.12 and on for 6.12+)"
+        required: true
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - off
+          - "678"
+          - "123"
+          - "345"
+      zram:
+        description: "Enable ZRAM LZ4KD enhancement (not supported on 6.12/6.18)"
+        required: true
+        type: boolean
+        default: false
+      rekernel:
+        description: "Enable Re-Kernel driver"
+        required: true
+        type: boolean
+        default: false
+      cve_patch:
+        description: "CVE-2026-43499 patch chain"
+        required: true
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - "true"
+          - "false"
+      kpm:
+        description: "ReSukiSU KPM support"
+        required: true
+        type: choice
+        default: "disabled"
+        options:
+          - disabled
+          - enabled
+      custom_version:
+        description: "Optional short custom kernel version name"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gki-${{ github.ref }}-${{ inputs.target }}-${{ inputs.sub_level }}
+  cancel-in-progress: false
+
+env:
+  CI: "true"
+  CI_MODE: "true"
+  APP_LANG: "en"
+  GIT_TERMINAL_PROMPT: "0"
+  DEBIAN_FRONTEND: "noninteractive"
+  CI_TARGET_VERSION: ${{ inputs.target }}
+  SUB_LEVEL: ${{ inputs.sub_level }}
+  KSU_VARIANT: ${{ inputs.ksu_variant }}
+  KSU_BRANCH: ${{ inputs.ksu_branch }}
+  DROIDSPACES: ${{ inputs.droidspaces }}
+  USE_ZRAM: ${{ inputs.zram }}
+  USE_REKERNEL: ${{ inputs.rekernel }}
+  CVE_2026_43499_PATCH: ${{ inputs.cve_patch }}
+  USE_KPM: ${{ inputs.kpm }}
+  KERNEL_SOURCE_MIRROR: "direct"
+  CUSTOM_VERSION: ${{ inputs.custom_version }}
+  OUTPUT_DIR: ${{ github.workspace }}/build/out
+
+jobs:
+  build:
+    name: ${{ inputs.target }}-${{ inputs.sub_level }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            /usr/share/swift \
+            /usr/local/.ghcup \
+            /usr/local/share/powershell \
+            /opt/microsoft
+          if command -v docker >/dev/null 2>&1; then
+            sudo docker image prune -af || true
+          fi
+          sudo apt-get clean
+          df -hT
+          free -h
+
+      - name: Add swap space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          sudo sysctl vm.swappiness=10
+          free -h
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git curl make gcc g++ build-essential libssl-dev \
+            bison flex libelf-dev dwarves ccache python3 \
+            clang lld bc rsync cpio perl patch zip gawk zstd
+
+      - name: Show build configuration
+        shell: bash
+        run: |
+          echo "Target: ${CI_TARGET_VERSION}"
+          echo "Sublevel: ${SUB_LEVEL}"
+          echo "KernelSU: ${KSU_VARIANT} / ${KSU_BRANCH}"
+          echo "Droidspaces: ${DROIDSPACES}"
+          echo "ZRAM: ${USE_ZRAM}"
+          echo "Re-Kernel: ${USE_REKERNEL}"
+          echo "CVE patch: ${CVE_2026_43499_PATCH}"
+          echo "KPM: ${USE_KPM}"
+          df -hT
+          free -h
+
+      - name: Build kernel
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x build_kernel.sh
+          ./build_kernel.sh --ci
+
+      - name: Upload kernel artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: GKI-${{ inputs.target }}-${{ inputs.sub_level }}-${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            build/out/**/*.zip
+            build/out/**/Image
+
+      - name: Upload patch reject files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-rejects-${{ github.run_number }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: build/out/**/patch-rejects/**
