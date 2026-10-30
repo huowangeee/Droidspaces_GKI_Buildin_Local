@@ -82,4 +82,5 @@ gcc/
 
 # CI config (if any)
 *.yml
+!/.github/workflows/*.yml
 参考项目
