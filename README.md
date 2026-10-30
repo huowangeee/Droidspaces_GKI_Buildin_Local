@@ -47,6 +47,33 @@ chmod +x build_kernel.sh
 ./build_kernel.sh
 ```
 
+## ☁️ GitHub Actions 云编译
+
+仓库已经包含 `.github/workflows/build.yml`，上传到 GitHub 后无需本地 Linux 环境即可编译。
+
+1. 打开仓库的 **Actions** 页面；
+2. 选择 **Build GKI Kernel**；
+3. 点击 **Run workflow**；
+4. 选择目标 Android/内核版本、子版本、KernelSU、Droidspaces 等功能；
+5. 编译完成后，在该次运行页面底部下载 `GKI-*` Artifact。
+
+子版本可以填写 `77`、`173` 等具体版本，也可以填写 `X` 自动选择当前 LTS。云编译默认启用无人值守模式、编译前磁盘清理、4 GB Swap，以及 6 小时任务超时。
+
+也可以在本机 Linux 环境手动使用 CI 模式：
+
+```bash
+export CI_MODE=true
+export APP_LANG=en
+export CI_TARGET_VERSION=android15-6.6
+export SUB_LEVEL=X
+export KSU_VARIANT=ReSukiSU
+export DROIDSPACES=auto
+export OUTPUT_DIR="$PWD/build/out"
+./build_kernel.sh --ci
+```
+
+CI 模式支持的常用环境变量包括：`CI_TARGET_VERSION`、`SUB_LEVEL`、`KSU_VARIANT`、`KSU_BRANCH`、`DROIDSPACES`、`USE_ZRAM`、`USE_REKERNEL`、`CVE_2026_43499_PATCH`、`USE_KPM`、`CUSTOM_VERSION`、`KERNEL_SOURCE`、`KERNEL_SOURCE_TARBALL` 和 `KERNEL_SOURCE_MIRROR`。
+
 ## 🛠 脚本功能
 
 交互式脚本提供以下功能：
