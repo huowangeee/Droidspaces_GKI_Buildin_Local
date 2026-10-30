@@ -103,7 +103,7 @@ env:
   USE_REKERNEL: ${{ inputs.rekernel }}
   CVE_2026_43499_PATCH: ${{ inputs.cve_patch }}
   USE_KPM: ${{ inputs.kpm }}
-  KERNEL_SOURCE_MIRROR: "direct"
+  KERNEL_SOURCE_MIRROR: "gh-proxy"
   CUSTOM_VERSION: ${{ inputs.custom_version }}
   OUTPUT_DIR: ${{ github.workspace }}/build/out
 
