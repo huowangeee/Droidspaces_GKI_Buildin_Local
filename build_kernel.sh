@@ -31,6 +31,7 @@ show_help() {
     echo "  --help       $(txt "显示此帮助信息" "Show this help message")"
     echo "  --quick      $(txt "使用上次保存的配置直接编译" "Build directly with the saved config")"
     echo "  --config     $(txt "仅配置，不编译" "Configure only, do not build")"
+    echo "  --ci         $(txt "从环境变量读取配置并无人值守编译" "Build non-interactively from environment variables")"
     echo "  --reset      $(txt "清除保存的配置" "Clear the saved config")"
     echo ""
     echo "$(txt "首次运行将进入交互式配置菜单。" "First run opens the interactive configuration menu.")"
@@ -256,13 +257,72 @@ _lookup_os_patch_level() {
 _set_kernel_version_from_id() {
     local version_id="$1"
     if [[ "$version_id" =~ ^(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)$ ]]; then
+        local detected_sub="${BASH_REMATCH[3]%-lts}"
         BUILD_CFG[android_version]="${BASH_REMATCH[1]}"
         BUILD_CFG[kernel_version]="${BASH_REMATCH[2]}"
-        BUILD_CFG[sub_level]="${BASH_REMATCH[3]}"
+        BUILD_CFG[sub_level]="$detected_sub"
         _lookup_os_patch_level
         return 0
     fi
     return 1
+}
+
+# 生成上游源码拉取脚本所需的交互输入。上游脚本目前没有 TARGET_VERSION
+# 参数，因此在 CI 中需要按固定菜单顺序传入大版本、小版本和下载源。
+_ci_source_fetch_answers() {
+    local key="${BUILD_CFG[android_version]}-${BUILD_CFG[kernel_version]}"
+    local sub="${BUILD_CFG[sub_level]}"
+    local -a remote_sublevels=()
+    local major_index=0 sub_index=0 i=1
+    local line label remote_sub _patch _rev
+
+    for line in "${KERNEL_VERSION_KEYS[@]}"; do
+        if [ "$line" = "$key" ]; then
+            major_index=$i
+            break
+        fi
+        ((i += 1))
+    done
+    [ "$major_index" -gt 0 ] || {
+        log_error "$(txt "不支持的 Android/内核版本组合" "Unsupported Android/kernel version combination"): $key"
+        return 1
+    }
+
+    while IFS='|' read -r label remote_sub _patch _rev; do
+        [ -z "$label" ] && continue
+        remote_sublevels+=("$remote_sub")
+    done <<< "${KERNEL_VERSIONS[$key]}"
+
+    i=1
+    for remote_sub in "${remote_sublevels[@]}"; do
+        if [ "$remote_sub" = "$sub" ]; then
+            sub_index=$i
+            break
+        fi
+        ((i += 1))
+    done
+    [ "$sub_index" -gt 0 ] || {
+        log_error "$(txt "目标版本不支持该子版本" "The target does not support this sublevel"): $key.$sub"
+        return 1
+    }
+
+    printf '%s\n' "$major_index" "$sub_index"
+
+    case "${KERNEL_SOURCE_MIRROR:-direct}" in
+        direct) printf '%s\n' "1" ;;
+        gh-proxy) printf '%s\n' "2" ;;
+        gh-llkk) printf '%s\n' "3" ;;
+        gh-ddlc) printf '%s\n' "4" ;;
+        "")
+            printf '%s\n' "1"
+            ;;
+        *)
+            printf '%s\n' "5" "$KERNEL_SOURCE_MIRROR"
+            ;;
+    esac
+
+    # Upstream asks whether to speed-test, then whether to use the source.
+    printf '%s\n' "n" ""
 }
 
 # 获取内核源码 (远程脚本)
@@ -281,10 +341,30 @@ fetch_kernel_source() {
     mkdir -p "$HOME/kernel-sources"
     cd "$HOME"
 
+    local fetch_script="/tmp/fetch_kernel_source_no-extract.$$.sh"
     local tmp_out="/tmp/fetch_kernel_output.log"
     local ret=0
-    SCRIPT_LANG="${APP_LANG:-zh}" bash <(curl -LSs "$actual_url") 2>&1 | tee "$tmp_out" || ret=${PIPESTATUS[0]}
-    ret=${ret:-${PIPESTATUS[0]}}
+    if ! curl -LSsf "$actual_url" -o "$fetch_script"; then
+        log_error "$(txt "源码拉取脚本下载失败" "Failed to download the source fetch script"): $actual_url"
+        rm -f "$fetch_script"
+        return 1
+    fi
+    if [ "${CI_MODE:-false}" = "true" ]; then
+        local ci_answers=""
+        ci_answers=$(_ci_source_fetch_answers) || {
+            rm -f "$fetch_script"
+            return 1
+        }
+        printf '%s\n' "$ci_answers" | \
+            SCRIPT_LANG="${APP_LANG:-en}" OUTPUT_DIR="$HOME/kernel-sources" TMPDIR="$HOME/kernel-sources/.tmp" \
+            EXTRACT=no KEEP_TARBALL=yes \
+            bash "$fetch_script" 2>&1 | tee "$tmp_out" || ret=${PIPESTATUS[1]}
+        ret=${ret:-${PIPESTATUS[1]}}
+    else
+        SCRIPT_LANG="${APP_LANG:-zh}" bash "$fetch_script" 2>&1 | tee "$tmp_out" || ret=${PIPESTATUS[0]}
+        ret=${ret:-${PIPESTATUS[0]}}
+    fi
+    rm -f "$fetch_script"
 
     if [ $ret -ne 0 ]; then
         log_error "$(txt "内核源码获取失败" "Kernel source fetch failed") ($(txt "退出码" "exit code"): $ret)"
@@ -315,8 +395,8 @@ fetch_kernel_source() {
         BUILD_CFG[kernel_source_tarball]="$archive_path"
         BUILD_CFG[kernel_source]=""
         local archive_name=$(basename "$archive_path")
-        if [[ "$archive_name" =~ ^kernel-source-(android[0-9]+-[0-9]+\.[0-9]+-.+)\.tar\.gz$ ]]; then
-            _set_kernel_version_from_id "${BASH_REMATCH[1]}" || true
+        if [[ "$archive_name" =~ ^kernel-(full-)?source-(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)\.tar\.(gz|zst|zstd|xz)$ ]]; then
+            _set_kernel_version_from_id "${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}" || true
         fi
         log_info "$(txt "已自动设置内核源码包" "Auto-detected kernel source archive"): $(basename "$archive_path")"
     elif [ -n "$source_path" ] && [ -d "$source_path" ]; then
@@ -332,15 +412,15 @@ fetch_kernel_source() {
 
     # 扫描 kernel-sources/ 中的压缩包，自动设置
     shopt -s nullglob
-    local tarballs=("$HOME/kernel-sources"/*.tar.gz)
+    local tarballs=("$HOME/kernel-sources"/*.tar.gz "$HOME/kernel-sources"/*.tar.zst "$HOME/kernel-sources"/*.tar.xz)
     shopt -u nullglob
     if [ -z "${BUILD_CFG[kernel_source_tarball]:-}" ] && [ ${#tarballs[@]} -gt 0 ] && [ -n "${BUILD_CFG[android_version]}" ]; then
         local version_pattern="${BUILD_CFG[android_version]}-${BUILD_CFG[kernel_version]}-${BUILD_CFG[sub_level]}"
         local matched=""
         for t in "${tarballs[@]}"; do
             local name=$(basename "$t")
-            if [[ "$name" =~ ^kernel-source-(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)\.tar\.gz$ ]]; then
-                if [ "${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}" = "$version_pattern" ]; then
+            if [[ "$name" =~ ^kernel-(full-)?source-(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)\.tar\.(gz|zst|zstd|xz)$ ]]; then
+                if [ "${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}" = "$version_pattern" ]; then
                     matched="$t"
                     break
                 fi
@@ -780,11 +860,11 @@ config_kernel_from_source_package() {
     fi
 
     shopt -s nullglob
-    local tarballs=("$src_dir"/*.tar.gz)
+    local tarballs=("$src_dir"/*.tar.gz "$src_dir"/*.tar.zst "$src_dir"/*.tar.xz)
     shopt -u nullglob
 
     if [ ${#tarballs[@]} -eq 0 ]; then
-        log_error "$(txt "未找到内核源码压缩包 (.tar.gz)" "No kernel source archive found (.tar.gz)")"
+        log_error "$(txt "未找到内核源码压缩包 (.tar.gz/.tar.zst/.tar.xz)" "No kernel source archive found (.tar.gz/.tar.zst/.tar.xz)")"
         log_info "$(txt "请先执行 '获取内核源码' 下载源码包" "Run 'Fetch Kernel Source' first to download source archives")"
         return 1
     fi
@@ -792,8 +872,8 @@ config_kernel_from_source_package() {
     local labels=()
     for t in "${tarballs[@]}"; do
         local name=$(basename "$t")
-        if [[ "$name" =~ ^kernel-source-(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)\.tar\.gz$ ]]; then
-            labels+=("${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}")
+        if [[ "$name" =~ ^kernel-(full-)?source-(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)\.tar\.(gz|zst|zstd|xz)$ ]]; then
+            labels+=("${BASH_REMATCH[2]}-${BASH_REMATCH[3]}-${BASH_REMATCH[4]}")
         else
             labels+=("$name")
         fi
@@ -805,10 +885,10 @@ config_kernel_from_source_package() {
     local name=$(basename "$chosen")
 
     # 解析版本号
-    if [[ "$name" =~ ^kernel-source-(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)\.tar\.gz$ ]]; then
-        BUILD_CFG[android_version]="${BASH_REMATCH[1]}"
-        BUILD_CFG[kernel_version]="${BASH_REMATCH[2]}"
-        BUILD_CFG[sub_level]="${BASH_REMATCH[3]}"
+    if [[ "$name" =~ ^kernel-(full-)?source-(android[0-9]+)-([0-9]+\.[0-9]+)-(.+)\.tar\.(gz|zst|zstd|xz)$ ]]; then
+        BUILD_CFG[android_version]="${BASH_REMATCH[2]}"
+        BUILD_CFG[kernel_version]="${BASH_REMATCH[3]}"
+        BUILD_CFG[sub_level]="${BASH_REMATCH[4]}"
         BUILD_CFG[kernel_source_tarball]="$chosen"
         _lookup_os_patch_level
         log_info "$(txt "已识别内核版本" "Detected kernel version"): ${BUILD_CFG[android_version]}-${BUILD_CFG[kernel_version]}-${BUILD_CFG[sub_level]}"
@@ -836,7 +916,17 @@ extract_kernel_source_tarball() {
     fi
 
     log_step "$(txt "解压内核源码包" "Extract kernel source archive")"
-    local extracted_dir="$HOME/kernel-sources/$(basename "${tarball%.tar.gz}")"
+    local archive_name=$(basename "$tarball")
+    local archive_stem="$archive_name"
+    case "$archive_name" in
+        *.tar.gz) archive_stem="${archive_name%.tar.gz}" ;;
+        *.tar.zst) archive_stem="${archive_name%.tar.zst}" ;;
+        *.tar.zstd) archive_stem="${archive_name%.tar.zstd}" ;;
+        *.tar.xz) archive_stem="${archive_name%.tar.xz}" ;;
+        *.tgz) archive_stem="${archive_name%.tgz}" ;;
+        *.txz) archive_stem="${archive_name%.txz}" ;;
+    esac
+    local extracted_dir="$HOME/kernel-sources/$archive_stem"
 
     if [ -d "$extracted_dir/common" ] || [ -f "$extracted_dir/Makefile" ]; then
         log_info "$(txt "已存在有效源码目录" "Found existing valid source directory"): $extracted_dir"
@@ -847,10 +937,68 @@ extract_kernel_source_tarball() {
             mv "$extracted_dir" "$backup_dir"
             log_warn "$(txt "旧目录已保留为" "Old directory kept as"): $backup_dir"
         fi
-        mkdir -p "$extracted_dir"
-        if ! tar -xzf "$tarball" -C "$extracted_dir" --strip-components=1; then
-            log_error "$(txt "源码包解压失败" "Failed to extract source archive"): $tarball"
+        # 先解压到临时目录，再自动识别压缩包内是否带顶层目录。上游的
+        # full-source 包通常直接包含 common/，而部分旧包多包一层目录。
+        local staging_dir="$HOME/kernel-sources/.extract-${archive_stem}-$$"
+        rm -rf "$staging_dir"
+        mkdir -p "$staging_dir"
+        case "$tarball" in
+            *.tar.zst|*.tar.zstd)
+                tar -I zstd -xf "$tarball" -C "$staging_dir" || {
+                    log_error "$(txt "源码包解压失败" "Failed to extract source archive"): $tarball"
+                    rm -rf "$staging_dir"
+                    return 1
+                }
+                ;;
+            *.tar.gz|*.tgz)
+                tar -xzf "$tarball" -C "$staging_dir" || {
+                    log_error "$(txt "源码包解压失败" "Failed to extract source archive"): $tarball"
+                    rm -rf "$staging_dir"
+                    return 1
+                }
+                ;;
+            *.tar.xz|*.txz)
+                tar -xJf "$tarball" -C "$staging_dir" || {
+                    log_error "$(txt "源码包解压失败" "Failed to extract source archive"): $tarball"
+                    rm -rf "$staging_dir"
+                    return 1
+                }
+                ;;
+            *)
+                tar -xf "$tarball" -C "$staging_dir" || {
+                    log_error "$(txt "源码包解压失败" "Failed to extract source archive"): $tarball"
+                    rm -rf "$staging_dir"
+                    return 1
+                }
+                ;;
+        esac
+
+        local source_root=""
+        if [ -d "$staging_dir/common" ] || [ -f "$staging_dir/Makefile" ]; then
+            source_root="$staging_dir"
+        else
+            local common_candidate=""
+            common_candidate=$(find "$staging_dir" -mindepth 2 -maxdepth 3 -type d -name common -print -quit 2>/dev/null || true)
+            if [ -n "$common_candidate" ]; then
+                source_root="${common_candidate%/common}"
+            else
+                local makefile_candidate=""
+                makefile_candidate=$(find "$staging_dir" -mindepth 2 -maxdepth 3 -type f -name Makefile -print -quit 2>/dev/null || true)
+                [ -n "$makefile_candidate" ] && source_root=$(dirname "$makefile_candidate")
+            fi
+        fi
+
+        if [ -z "$source_root" ]; then
+            log_error "$(txt "解压后未找到 common/ 或 Makefile，源码包可能不完整" "common/ or Makefile was not found after extraction; the source archive may be incomplete"): $tarball"
+            rm -rf "$staging_dir"
             return 1
+        fi
+
+        if [ "$source_root" = "$staging_dir" ]; then
+            mv "$staging_dir" "$extracted_dir"
+        else
+            mv "$source_root" "$extracted_dir"
+            rm -rf "$staging_dir"
         fi
         # 删除压缩包自带的 Bazel 缓存（含其他机器的硬编码路径）
         rm -rf "$extracted_dir/out" 2>/dev/null || true
@@ -1022,9 +1170,195 @@ _cleanup_extracted_source() {
 }
 
 # ================================================================
+# CI / GitHub Actions 无人值守入口
+# ================================================================
+
+_ci_bool() {
+    case "${1,,}" in
+        1|true|yes|y|on) printf 'true' ;;
+        0|false|no|n|off|"") printf 'false' ;;
+        *)
+            log_error "$(txt "无效的布尔值" "Invalid boolean value"): $1"
+            return 1
+            ;;
+    esac
+}
+
+_ci_lookup_version() {
+    local android_ver="$1"
+    local kernel_ver="$2"
+    local sub_level="$3"
+    local key="${android_ver}-${kernel_ver}"
+    local label sub patch rev
+    local found=false
+
+    if [ -z "${KERNEL_VERSIONS[$key]:-}" ]; then
+        log_error "$(txt "不支持的 Android/内核版本组合" "Unsupported Android/kernel version combination"): $key"
+        return 1
+    fi
+
+    while IFS='|' read -r label sub patch rev; do
+        [ -z "$label" ] && continue
+        if [ "$sub" = "$sub_level" ]; then
+            BUILD_CFG[android_version]="$android_ver"
+            BUILD_CFG[kernel_version]="$kernel_ver"
+            BUILD_CFG[sub_level]="$sub"
+            BUILD_CFG[os_patch_level]="$patch"
+            BUILD_CFG[revision]="$rev"
+            found=true
+            break
+        fi
+    done <<< "${KERNEL_VERSIONS[$key]}"
+
+    if [ "$found" != "true" ]; then
+        log_error "$(txt "目标版本不支持该子版本" "The target does not support this sublevel"): $key.$sub_level"
+        return 1
+    fi
+}
+
+run_ci_build() {
+    export CI_MODE=true
+    export APP_LANG="${APP_LANG:-en}"
+    load_mirror_config
+    show_banner
+    log_step "$(txt "GitHub Actions 无人值守构建" "GitHub Actions non-interactive build")"
+
+    local target="${CI_TARGET_VERSION:-}"
+    local android_ver="${ANDROID_VERSION:-}"
+    local kernel_ver="${KERNEL_VERSION:-}"
+    local sub_level="${SUB_LEVEL:-}"
+
+    if [ -n "$target" ]; then
+        android_ver="${target%-*}"
+        kernel_ver="${target##*-}"
+    fi
+    [ -n "$android_ver" ] || { log_error "ANDROID_VERSION 或 CI_TARGET_VERSION 未设置"; return 1; }
+    [ -n "$kernel_ver" ] || { log_error "KERNEL_VERSION 或 CI_TARGET_VERSION 未设置"; return 1; }
+    [ -n "$sub_level" ] || { log_error "SUB_LEVEL 未设置"; return 1; }
+
+    _ci_lookup_version "$android_ver" "$kernel_ver" "$sub_level" || return 1
+
+    local ksu_variant="${KSU_VARIANT:-None}"
+    case "${ksu_variant,,}" in
+        none|off|false) ksu_variant="None" ;;
+        resukisu|re-sukisu) ksu_variant="ReSukiSU" ;;
+        official|kernelsu) ksu_variant="Official" ;;
+        *)
+            log_error "$(txt "不支持的 KernelSU 变体" "Unsupported KernelSU variant"): $ksu_variant"
+            return 1
+            ;;
+    esac
+    BUILD_CFG[ksu_variant]="$ksu_variant"
+
+    case "${KSU_BRANCH:-Stable}" in
+        Dev|dev|development) BUILD_CFG[ksu_branch]="Dev(开发)" ;;
+        *) BUILD_CFG[ksu_branch]="Stable(标准)" ;;
+    esac
+    [ "$ksu_variant" = "None" ] && BUILD_CFG[ksu_branch]="-"
+
+    local droidspaces="${DROIDSPACES:-auto}"
+    case "$kernel_ver" in
+        6.12|6.18)
+            case "${droidspaces,,}" in
+                auto|on|true) BUILD_CFG[droidspaces]="on" ;;
+                off|false) BUILD_CFG[droidspaces]="off" ;;
+                *)
+                    log_error "$(txt "6.12/6.18 只支持 Droidspaces=auto/on/off" "6.12/6.18 only support Droidspaces=auto/on/off"): $droidspaces"
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            case "${droidspaces,,}" in
+                auto|on|true) BUILD_CFG[droidspaces]="678" ;;
+                678|123|345) BUILD_CFG[droidspaces]="$droidspaces" ;;
+                off|false) BUILD_CFG[droidspaces]="off" ;;
+                *)
+                    log_error "$(txt "不支持的 Droidspaces 模式" "Unsupported Droidspaces mode"): $droidspaces"
+                    return 1
+                    ;;
+            esac
+            ;;
+    esac
+
+    BUILD_CFG[use_zram]="$(_ci_bool "${USE_ZRAM:-false}")" || return 1
+    BUILD_CFG[use_rekernel]="$(_ci_bool "${USE_REKERNEL:-false}")" || return 1
+    BUILD_CFG[package_boot]="$(_ci_bool "${PACKAGE_BOOT:-true}")" || return 1
+
+    if { [ "$kernel_ver" = "6.12" ] || [ "$kernel_ver" = "6.18" ]; } && [ "${BUILD_CFG[use_zram]}" = "true" ]; then
+        log_warn "$(txt "6.12/6.18 不支持 ZRAM 增强，已自动关闭" "ZRAM enhancement is not supported on 6.12/6.18; disabling it")"
+        BUILD_CFG[use_zram]="false"
+    fi
+
+    local kpm="${USE_KPM:-disabled}"
+    case "${kpm,,}" in
+        enabled|true|on) BUILD_CFG[use_kpm]="enabled" ;;
+        disabled|false|off|"") BUILD_CFG[use_kpm]="disabled" ;;
+        *)
+            log_error "$(txt "不支持的 KPM 配置" "Unsupported KPM setting"): $kpm"
+            return 1
+            ;;
+    esac
+    if [ "$ksu_variant" != "ReSukiSU" ] && [ "${BUILD_CFG[use_kpm]}" = "enabled" ]; then
+        log_warn "$(txt "KPM 仅支持 ReSukiSU，已自动关闭" "KPM is only supported by ReSukiSU; disabling it")"
+        BUILD_CFG[use_kpm]="disabled"
+    fi
+
+    case "${CVE_2026_43499_PATCH:-auto}" in
+        auto)
+            if [ "${BUILD_CFG[droidspaces]}" = "off" ]; then
+                BUILD_CFG[cve_2026_43499_patch]="false"
+            else
+                BUILD_CFG[cve_2026_43499_patch]="true"
+            fi
+            ;;
+        *) BUILD_CFG[cve_2026_43499_patch]="$(_ci_bool "$CVE_2026_43499_PATCH")" || return 1 ;;
+    esac
+
+    BUILD_CFG[custom_version]="${CUSTOM_VERSION:-}"
+    BUILD_CFG[build_time]="${BUILD_TIME:-}"
+    BUILD_CFG[output_dir]="${OUTPUT_DIR:-$PROJECT_ROOT/build/out}"
+    BUILD_CFG[kernel_source]="${KERNEL_SOURCE:-}"
+    BUILD_CFG[kernel_source_tarball]="${KERNEL_SOURCE_TARBALL:-}"
+
+    if [ -n "${BUILD_CFG[kernel_source]}" ] && [ -d "${BUILD_CFG[kernel_source]}" ]; then
+        BUILD_CFG[kernel_source]=$(get_abs_path "${BUILD_CFG[kernel_source]}")
+    fi
+
+    if [ -n "${BUILD_CFG[kernel_source]}" ] && \
+        [ ! -d "${BUILD_CFG[kernel_source]}/common" ] && \
+        [ ! -f "${BUILD_CFG[kernel_source]}/Makefile" ]; then
+        log_error "$(txt "KERNEL_SOURCE 不是有效的 GKI 源码目录" "KERNEL_SOURCE is not a valid GKI source tree"): ${BUILD_CFG[kernel_source]}"
+        return 1
+    fi
+
+    setup_dependencies
+    setup_ccache
+
+    if [ -z "${BUILD_CFG[kernel_source]}" ] && [ -z "${BUILD_CFG[kernel_source_tarball]}" ]; then
+        if ! fetch_kernel_source; then
+            log_warn "$(txt "直连下载失败，尝试 GitHub 镜像" "Direct download failed; retrying through a GitHub mirror")"
+            KERNEL_SOURCE_MIRROR="${KERNEL_SOURCE_FALLBACK_MIRROR:-gh-proxy}"
+            export KERNEL_SOURCE_MIRROR
+            fetch_kernel_source || return 1
+        fi
+    fi
+
+    extract_kernel_source_tarball || return 1
+    show_config_summary
+    save_config
+
+    local build_ret=0
+    run_build || build_ret=$?
+    _cleanup_extracted_source
+    return "$build_ret"
+}
+
+# ================================================================
 # 入口
 # ================================================================
 
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
 case "${1:-}" in
     --help|-h)
         load_config 2>/dev/null || true
@@ -1064,6 +1398,9 @@ case "${1:-}" in
         save_config
         log_info "$(txt "配置已保存" "Config saved")"
         ;;
+    --ci)
+        run_ci_build
+        ;;
     --reset)
         load_config 2>/dev/null || true
         rm -f "$BUILD_CONFIG_FILE"
@@ -1080,3 +1417,4 @@ case "${1:-}" in
         main_menu
         ;;
 esac
+fi
